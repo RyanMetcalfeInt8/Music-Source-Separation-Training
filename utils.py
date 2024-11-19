@@ -13,6 +13,7 @@ from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 from numpy.typing import NDArray
 from typing import Dict, List
+import os
 
 
 def get_model_from_config(model_type, config_path):
@@ -105,6 +106,8 @@ def demix_track(config, model, mix, device, pbar=False):
     # windowingArray crossfades at segment boundaries to mitigate clicking artifacts
     windowingArray = _getWindowingArray(C, fade_size)
 
+    conversion_done = False
+
     with torch.cuda.amp.autocast(enabled=config.training.use_amp):
         with torch.inference_mode():
             req_shape = (len(prefer_target_instrument(config)),) + tuple(mix.shape)
@@ -131,7 +134,36 @@ def demix_track(config, model, mix, device, pbar=False):
 
                 if len(batch_data) >= batch_size or (i >= mix.shape[1]):
                     arr = torch.stack(batch_data, dim=0)
-                    x = model(arr)
+
+                    # original path
+                    if False:
+                        x = model.forward_original(arr)
+                    else:
+                        batch, channels, raw_audio_length = arr.shape
+
+                        # modified path, original forward broken into 3 steps (pre, forward, post)
+                        # We do this to move stft / istft outside of what will be converted into an onnx/openvino model.
+
+                        # pre
+                        stft_repr, stft_window, istft_length = model.pre_forward(arr)
+
+                        if conversion_done == False and "DISABLE_ONNX_CONVERSION" not in os.environ:
+                            conversion_done = True
+
+                            print("converting to onnx...")
+                            torch.onnx.export(model, (stft_repr), "model.onnx", input_names=["stft_repr"], output_names=["x", "masks"])
+                            print("conversion to onnx done..")
+
+                        # forward (this is the one we convert to onnx model)
+                        stft_repr, masks = model(stft_repr)
+
+                        #(kind of experimental thing where we broke generate_masks outside of forward function too)
+                        #x = model(stft_repr)
+                        #masks = model.generate_masks(x)
+
+                        # post
+                        x = model.post_forward(stft_repr, masks, stft_window, istft_length, batch, channels)
+
 
                     window = windowingArray
                     if i - step == 0:  # First audio chunk, no fadein
