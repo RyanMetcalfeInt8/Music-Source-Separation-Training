@@ -545,7 +545,167 @@ class HTDemucs(nn.Module):
         x = x.reshape(b, c // k, f * k, t)
         return x
 
+    def pre_forward(self, mix):
+        length = mix.shape[-1]
+        length_pre_pad = None
+        if self.use_train_segment:
+            if self.training:
+                self.segment = Fraction(mix.shape[-1], self.samplerate)
+            else:
+                training_length = int(self.segment * self.samplerate)
+                # print('Training length: {} Segment: {} Sample rate: {}'.format(training_length, self.segment, self.samplerate))
+                if mix.shape[-1] < training_length:
+                    length_pre_pad = mix.shape[-1]
+                    mix = F.pad(mix, (0, training_length - length_pre_pad))
+                # print("Mix: {}".format(mix.shape))
+        # print("Length: {}".format(length))
+        z = self._spec(mix)
+        # print("Z: {} Type: {}".format(z.shape, z.dtype))
+        mag = self._magnitude(z)
+        x = mag
+        # print("MAG: {} Type: {}".format(x.shape, x.dtype))
+
+        if self.num_subbands > 1:
+            x = self.cac2cws(x)
+        # print("After SUBBANDS: {} Type: {}".format(x.shape, x.dtype))
+
+        B, C, Fq, T = x.shape
+
+        # unlike previous Demucs, we always normalize because it is easier.
+        mean = x.mean(dim=(1, 2, 3), keepdim=True)
+        std = x.std(dim=(1, 2, 3), keepdim=True)
+        x = (x - mean) / (1e-5 + std)
+        # x will be the freq. branch input.
+
+        # Prepare the time branch input.
+        xt = mix
+        meant = xt.mean(dim=(1, 2), keepdim=True)
+        stdt = xt.std(dim=(1, 2), keepdim=True)
+        xt = (xt - meant) / (1e-5 + stdt)
+        return x, xt, std, mean, meant, stdt, z, length, length_pre_pad
+
+    def fwd(self, x, xt):
+        # print("XT: {}".format(xt.shape))
+
+        # okay, this is a giant mess I know...
+        saved = []  # skip connections, freq.
+        saved_t = []  # skip connections, time.
+        lengths = []  # saved lengths to properly remove padding, freq branch.
+        lengths_t = []  # saved lengths for time branch.
+        for idx, encode in enumerate(self.encoder):
+            lengths.append(x.shape[-1])
+            inject = None
+            if idx < len(self.tencoder):
+                # we have not yet merged branches.
+                lengths_t.append(xt.shape[-1])
+                tenc = self.tencoder[idx]
+                xt = tenc(xt)
+                # print("Encode XT {}: {}".format(idx, xt.shape))
+                if not tenc.empty:
+                    # save for skip connection
+                    saved_t.append(xt)
+                else:
+                    # tenc contains just the first conv., so that now time and freq.
+                    # branches have the same shape and can be merged.
+                    inject = xt
+            x = encode(x, inject)
+            # print("Encode X {}: {}".format(idx, x.shape))
+            if idx == 0 and self.freq_emb is not None:
+                # add frequency embedding to allow for non equivariant convolutions
+                # over the frequency axis.
+                frs = torch.arange(x.shape[-2], device=x.device)
+                emb = self.freq_emb(frs).t()[None, :, :, None].expand_as(x)
+                x = x + self.freq_emb_scale * emb
+
+            saved.append(x)
+        if self.crosstransformer:
+            if self.bottom_channels:
+                b, c, f, t = x.shape
+                x = rearrange(x, "b c f t-> b c (f t)")
+                x = self.channel_upsampler(x)
+                x = rearrange(x, "b c (f t)-> b c f t", f=f)
+                xt = self.channel_upsampler_t(xt)
+
+            x, xt = self.crosstransformer(x, xt)
+            # print("Cross Tran X {}, XT: {}".format(x.shape, xt.shape))
+
+            if self.bottom_channels:
+                x = rearrange(x, "b c f t-> b c (f t)")
+                x = self.channel_downsampler(x)
+                x = rearrange(x, "b c (f t)-> b c f t", f=f)
+                xt = self.channel_downsampler_t(xt)
+
+        for idx, decode in enumerate(self.decoder):
+            skip = saved.pop(-1)
+            x, pre = decode(x, skip, lengths.pop(-1))
+            # print('Decode {} X: {}'.format(idx, x.shape))
+            # `pre` contains the output just before final transposed convolution,
+            # which is used when the freq. and time branch separate.
+
+            offset = self.depth - len(self.tdecoder)
+            if idx >= offset:
+                tdec = self.tdecoder[idx - offset]
+                length_t = lengths_t.pop(-1)
+                if tdec.empty:
+                    assert pre.shape[2] == 1, pre.shape
+                    pre = pre[:, :, 0]
+                    xt, _ = tdec(pre, None, length_t)
+                else:
+                    skip = saved_t.pop(-1)
+                    xt, _ = tdec(xt, skip, length_t)
+                # print('Decode {} XT: {}'.format(idx, xt.shape))
+
+        # Let's make sure we used all stored skip connections.
+        assert len(saved) == 0
+        assert len(lengths_t) == 0
+        assert len(saved_t) == 0
+        return x, xt
+
+    def post_forward(self, x, xt, std, mean, meant, stdt, z, length, length_pre_pad):
+        S = len(self.sources)
+        B, dummy, Fq, T = x.shape
+
+        if self.num_subbands > 1:
+            x = x.view(B, -1, Fq, T)
+            # print("X view 1: {}".format(x.shape))
+            x = self.cws2cac(x)
+            # print("X view 2: {}".format(x.shape))
+
+        x = x.view(B, S, -1, Fq * self.num_subbands, T)
+        x = x * std[:, None] + mean[:, None]
+        # print("X returned: {}".format(x.shape))
+
+        zout = self._mask(z, x)
+        if self.use_train_segment:
+            if self.training:
+                x = self._ispec(zout, length)
+            else:
+                x = self._ispec(zout, training_length)
+        else:
+            x = self._ispec(zout, length)
+
+        if self.use_train_segment:
+            if self.training:
+                xt = xt.view(B, S, -1, length)
+            else:
+                xt = xt.view(B, S, -1, training_length)
+        else:
+            xt = xt.view(B, S, -1, length)
+        xt = xt * stdt[:, None] + meant[:, None]
+        x = xt + x
+        if length_pre_pad:
+            x = x[..., :length_pre_pad]
+        return x
+
+    # redefine forward function as 3 separate calls to pre, fwd, post
     def forward(self, mix):
+        x, xt, std, mean, meant, stdt, z, length, length_pre_pad = self.pre_forward(mix)
+        x, xt = self.fwd(x, xt)
+        x = self.post_forward(x, xt, std, mean, meant, stdt, z, length, length_pre_pad)
+        return x
+
+    # The original forward function before it was split into pre, fwd, and post
+    def forward_original(self, mix):
         length = mix.shape[-1]
         length_pre_pad = None
         if self.use_train_segment:
