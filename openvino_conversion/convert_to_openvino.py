@@ -13,6 +13,39 @@ import torch.nn as nn
 import openvino
 from openvino.tools.ovc import convert_model
 
+def convert_apollo(model, config):
+    print("convert_apollo start..")
+    chunk_size = config.audio.chunk_size
+
+    arr = torch.zeros([1, 2, chunk_size], dtype=torch.float32)
+
+    print("arr.shape = ", arr.shape)
+    B, nch, nsample = arr.shape
+
+    spec = model.pre_forward(arr)
+
+    with torch.inference_mode():
+        class FwdWrapper(nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+
+            def forward(self, spec):
+                return self.model.fwd(spec, B, nch, nsample)
+
+        print("Converting fwd model (pytorch->openvino)..")
+        fwdmodel = FwdWrapper(model)
+        with torch.no_grad():
+            ov_model = convert_model(fwdmodel, example_input=spec)
+            ov_model.validate_nodes_and_infer_types()
+            ov_model.inputs[0].get_tensor().set_names({"spec"})
+            ov_model.outputs[0].get_tensor().set_names({"est_spec"})
+            ov_model.reshape(spec.shape)
+            ov_model.validate_nodes_and_infer_types()
+            openvino.runtime.save_model(ov_model, "apollo_fwd.xml", compress_to_fp16=True)
+        print("done converting fwd model.")
+
+
 def convert_mel_band_roformer(model, config):
     print("convert_mel_band_roformer start..")
     chunk_size = config.audio.chunk_size
@@ -144,6 +177,8 @@ def run():
         convert_mel_band_roformer(model, config)
     elif type(model).__module__ == 'models.demucs4ht' and type(model).__name__ == 'HTDemucs':
         convert_htdemucs(model, config)
+    elif type(model).__module__ == 'models.look2hear.models.apollo' and type(model).__name__ == 'Apollo':
+        convert_apollo(model, config)
     else:
         print("This conversion script does not yet have support for model of type = ", type(model))
     

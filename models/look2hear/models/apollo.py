@@ -128,13 +128,15 @@ class Roformer(nn.Module):
 
         return feature_rope.reshape(feature.shape)
 
+    # note, modified this function to replace .mT with .transpose(-2,-1), as .mT is not a support op for onnx/OpenVINO.
     def forward(self, input):
         # input shape: B, N, T
 
         B, _, T = input.shape
 
         weight = self.weight(self.input_drop(self.input_norm(input))).reshape(B, self.num_head, self.hidden_size * 3,
-                                                                              T).mT
+                                                                              T).transpose(-2, -1)
+
         Q, K, V = torch.split(weight, self.hidden_size, dim=-1)  # B, num_head, T, N
 
         # rotary positional embedding
@@ -144,7 +146,7 @@ class Roformer(nn.Module):
         attention_output = F.scaled_dot_product_attention(Q_rot.contiguous(), K_rot.contiguous(), V.contiguous(),
                                                           dropout_p=self.attention_drop,
                                                           is_causal=self.causal)  # B, num_head, T, N
-        attention_output = attention_output.mT.reshape(B, -1, T)
+        attention_output = attention_output.transpose(-2, -1).reshape(B, -1, T)
         output = self.output(attention_output) + input
 
         gate, z = self.MLP(output).chunk(2, dim=1)
@@ -264,6 +266,10 @@ class Apollo(BaseModel):
                                              nn.GLU(dim=1)
                                              )
                                )
+        # returning / using complex types in the fwd function can be problematic for conversions to,
+        # onnx / OpenVINO so when this is set, it keeps tensor types as real and then defers complex
+        # conversion to post_forward function.
+        self.no_complex_in_fwd = True
 
     def spec_band_split(self, input):
 
@@ -301,7 +307,84 @@ class Apollo(BaseModel):
 
         return subband_feature
 
+    # This basically just runs the stft operation, extracted from self.spec_band_split
+    def pre_forward(self, input):
+        B, nch, nsample = input.shape
+
+        spec = torch.stft(input.view(B * nch, nsample), n_fft=self.win, hop_length=self.stride,
+                          window=torch.hann_window(self.win).to(input.device), return_complex=True)
+        spec = torch.view_as_real(spec)
+        return spec
+
+    # equivelant to 'forward_orig', but with stft / istft stripped out. This is the function that we convert to an OpenVINO model.    
+    def fwd(self, spec, B, nch, nsample):
+        spec = torch.view_as_complex(spec)
+
+        # spec here is the output of torch.stft (see self.spec_band_split)
+        # so what follows here is the rest of self.spec_band_split
+        subband_spec = []
+        subband_spec_norm = []
+        subband_power = []
+        band_idx = 0
+        for i in range(self.nband):
+            this_spec = spec[:, band_idx:band_idx + self.band_width[i]]
+            subband_spec.append(this_spec)  # B, BW, T
+            subband_power.append((this_spec.abs().pow(2).sum(1) + self.eps).sqrt().unsqueeze(1))  # B, 1, T
+            subband_spec_norm.append(
+                torch.complex(this_spec.real / subband_power[-1], this_spec.imag / subband_power[-1]))  # B, BW, T
+            band_idx += self.band_width[i]
+        subband_power = torch.cat(subband_power, 1)  # B, nband, T
+
+        # and starting here, is the rest of self.feature_extractor
+
+        # normalization and bottleneck
+        subband_feature = []
+        for i in range(self.nband):
+            concat_spec = torch.cat(
+                [subband_spec_norm[i].real, subband_spec_norm[i].imag, torch.log(subband_power[:, i].unsqueeze(1))], 1)
+            subband_feature.append(self.BN[i](concat_spec))
+        subband_feature = torch.stack(subband_feature, 1)  # B, nband, N, T
+
+        # finally, here we're sitting at the output of self.feature_extractor
+
+        feature = self.net(subband_feature)
+        est_spec = []
+        for i in range(self.nband):
+            this_RI = self.output[i](feature[:, i]).view(B * nch, 2, self.band_width[i], -1)
+            if self.no_complex_in_fwd:
+                est_spec.append(this_RI)
+            else:
+                complex_RI = torch.complex(this_RI[:, 0], this_RI[:, 1])
+                est_spec.append(complex_RI)
+
+        if self.no_complex_in_fwd:
+            est_spec = torch.cat(est_spec, 2)
+        else:
+            est_spec = torch.cat(est_spec, 1)
+
+        # returning est_spec, as the istft is run as another function
+        return est_spec
+
+    def post_forward(self, est_spec, B, nch, nsample):
+        if self.no_complex_in_fwd:
+           stft_repr =  torch.complex(est_spec[:, 0], est_spec[:, 1])
+
+        window = torch.hann_window(self.win)
+        output = torch.istft(stft_repr, n_fft=self.win, hop_length=self.stride,
+                             window=window, win_length=len(window), return_complex=False, length=None).view(B, nch, -1)
+
+        return output
+
+    # redefine forward function as 3 separate calls to pre, fwd, post so that we can test with inference.py
     def forward(self, input):
+        B, nch, nsample = input.shape
+        spec = self.pre_forward(input)
+        est_spec = self.fwd(spec, B, nch, nsample)
+        output = self.post_forward(est_spec, B, nch, nsample)
+        return output
+
+    # original unmodified forward function (for reference)
+    def forward_orig(self, input):
 
         B, nch, nsample = input.shape
 
