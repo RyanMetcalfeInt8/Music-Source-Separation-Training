@@ -11,18 +11,18 @@ pip install -r requirements.txt
 pip install onnx openvino onnxscript
 ```
 
-Convert MelBandRoformer Models using config (yaml file) and checkpoint:
+## Convert MelBandRoformer Models using config (yaml file) and checkpoint:
 ```
 cd openvino_conversion
 python convert_to_openvino.py --model_type mel_band_roformer --config_path "dereverb_mel_band_roformer_anvuew.yaml" --start_check_point "dereverb_mel_band_roformer_mono_anvuew_sdr_20.4029.ckpt"
 ```
 
-Convert HTDemucs Models:
+## Convert HTDemucs Models:
 ```
 python convert_to_openvino.py --model_type htdemucs --config_path "config_musdb18_htdemucs.yaml" --start_check_point "955717e8-8726e21a.th"
 ```
 
-Convert Apollo Models:
+## Convert Apollo Models:
 ```
 python convert_to_openvino.py --model_type apollo --config_path "config_apollo.yaml" --start_check_point "pytorch_model.bin"
 ```
@@ -66,6 +66,12 @@ inference:
 ```
 
 (Basically, bumping up feature_dim to 384 as this is how it's defined in: https://github.com/deton24/Lew-s-vocal-enhancer-for-Apollo-by-JusperLee/releases/download/uni/config_apollo_uni.yaml)
+
+## Convert MDX23C Models:
+
+```
+python convert_to_openvino.py --model_type mdx23c --config_path "config_mdx23c.yaml" --start_check_point "drumsep_5stems_mdx23c_jarredou.ckpt"
+```
 
 For reference, here is the pip list for a successful conversion env (Python 3.10.11):
 ```

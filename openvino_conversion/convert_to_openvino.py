@@ -13,6 +13,91 @@ import torch.nn as nn
 import openvino
 from openvino.tools.ovc import convert_model
 
+
+def convert_mdx23c(model, config):
+    chunk_size = config.audio.chunk_size
+
+    print("chunk_size = ", chunk_size)
+
+    arr = torch.zeros([1, 2, chunk_size], dtype=torch.float32)
+
+    pre_fwd_out = model.pre_forward(arr)
+    fwd_out = model.fwd(pre_fwd_out)
+
+
+    with torch.inference_mode():
+
+        #Converting the 'pre_forward' (stft routine) actually works fine, but C++
+        # implementation just used native libtorch instead.
+        '''
+        class PreWrapper(nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+
+            def forward(self, arr):
+                x = self.model.pre_forward(arr)
+
+                return x
+        print("Converting pre-model..")
+        premodel = PreWrapper(model)
+        with torch.no_grad():
+            ov_model = convert_model(premodel, example_input=arr)
+            ov_model.validate_nodes_and_infer_types()
+            ov_model.inputs[0].get_tensor().set_names({"x_in"})
+            ov_model.outputs[0].get_tensor().set_names({"x_out"})
+            ov_model.reshape(arr.shape)
+            ov_model.validate_nodes_and_infer_types()
+            openvino.runtime.save_model(ov_model, "mdx23c_pre.xml", compress_to_fp16=True)
+        print("done converting pre-model...")
+       '''
+
+        class FwdWrapper(nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+
+            def forward(self, x):
+                return self.model.fwd(x)
+
+        print("Converting fwd model (pytorch->openvino)..")
+        fwdmodel = FwdWrapper(model)
+        with torch.no_grad():
+            ov_model = convert_model(fwdmodel, example_input=pre_fwd_out)
+            ov_model.validate_nodes_and_infer_types()
+            ov_model.inputs[0].get_tensor().set_names({"x_in"})
+            ov_model.outputs[0].get_tensor().set_names({"x_out"})
+            ov_model.reshape(pre_fwd_out.shape)
+            ov_model.validate_nodes_and_infer_types()
+            openvino.runtime.save_model(ov_model, "mdx23c_fwd.xml", compress_to_fp16=True)
+        print("done converting fwd model.")
+
+        # seems to be some issue in post_forward for conversion.
+        # conversion itself seems to work fine, but failures occur during 'reshape', after conversion
+        # TODO: Raise this issue to OpenVINO team.
+        '''
+        class PostWrapper(nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+
+            def forward(self, x):
+                x = self.model.post_fwd(x)
+                return x
+
+        print("converting post-model...")
+        postmodel = PostWrapper(model)
+        with torch.no_grad():
+            ov_model = convert_model(postmodel, example_input=fwd_out)
+            ov_model.validate_nodes_and_infer_types()
+            ov_model.inputs[0].get_tensor().set_names({"x_in"})
+            ov_model.outputs[0].get_tensor().set_names({"x_out"})
+            ov_model.reshape(fwd_out.shape)
+            ov_model.validate_nodes_and_infer_types()
+            openvino.runtime.save_model(ov_model, "mdx23c_post.xml", compress_to_fp16=True)
+        print("done converting post-model...")
+        '''
+
 def convert_apollo(model, config):
     print("convert_apollo start..")
     chunk_size = config.audio.chunk_size
@@ -170,15 +255,15 @@ def run():
         load_start_checkpoint(args, model, type_='inference')
     
     model = model.to("cpu")
-    
-    print("type(model) = ", type(model))
-    
+
     if type(model).__module__ == 'models.bs_roformer.mel_band_roformer' and type(model).__name__ == 'MelBandRoformer':
         convert_mel_band_roformer(model, config)
     elif type(model).__module__ == 'models.demucs4ht' and type(model).__name__ == 'HTDemucs':
         convert_htdemucs(model, config)
     elif type(model).__module__ == 'models.look2hear.models.apollo' and type(model).__name__ == 'Apollo':
         convert_apollo(model, config)
+    elif type(model).__module__ == 'models.mdx23c_tfc_tdf_v3' and type(model).__name__ == 'TFC_TDF_net':
+        convert_mdx23c(model, config)
     else:
         print("This conversion script does not yet have support for model of type = ", type(model))
     

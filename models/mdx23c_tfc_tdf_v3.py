@@ -10,6 +10,10 @@ class STFT:
         self.window = torch.hann_window(window_length=self.n_fft, periodic=True)
         self.dim_f = config.dim_f
 
+        print("self.n_fft = ", self.n_fft)
+        print("self.hop_length = ", self.hop_length)
+        print("self.dim_f = ", self.dim_f)
+
     def __call__(self, x):
         window = self.window.to(x.device)
         batch_dims = x.shape[:-2]
@@ -201,8 +205,55 @@ class TFC_TDF_net(nn.Module):
         x = x.reshape(b, c // k, f * k, t)
         return x
 
-    def forward(self, x):
+    def pre_forward(self, x):
+        x = self.stft(x)
+        return x
 
+    def fwd(self, x):
+        mix = x = self.cac2cws(x)
+
+        first_conv_out = x = self.first_conv(x)
+
+        x = x.transpose(-1, -2)
+
+        encoder_outputs = []
+        for block in self.encoder_blocks:
+            x = block.tfc_tdf(x)
+            encoder_outputs.append(x)
+            x = block.downscale(x)
+
+        x = self.bottleneck_block(x)
+
+        for block in self.decoder_blocks:
+            x = block.upscale(x)
+            x = torch.cat([x, encoder_outputs.pop()], 1)
+            x = block.tfc_tdf(x)
+
+        x = x.transpose(-1, -2)
+
+        x = x * first_conv_out  # reduce artifacts
+
+        x = self.final_conv(torch.cat([mix, x], 1))
+
+        x = self.cws2cac(x)
+
+        if self.num_target_instruments > 1:
+            b, c, f, t = x.shape
+            x = x.reshape(b, self.num_target_instruments, -1, f, t)
+
+        return x
+
+    def post_fwd(self, x):
+        x = self.stft.inverse(x)
+        return x
+
+    def forward(self, x):
+        x = self.pre_forward(x)
+        x = self.fwd(x)
+        x = self.post_fwd(x)
+        return x
+
+    def forward_old(self, x):
         x = self.stft(x)
 
         mix = x = self.cac2cws(x)
