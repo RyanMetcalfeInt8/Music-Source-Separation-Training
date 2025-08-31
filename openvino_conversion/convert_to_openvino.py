@@ -14,6 +14,35 @@ import openvino
 from openvino.tools.ovc import convert_model
 
 
+def patch_nan_to_zero(model):
+    from openvino.runtime import opset10 as opset  # opset10 has IsNaN + Select 
+    def nan_to_zero(t):
+        # Build: select(is_nan(t), 0(t.dtype), t)
+        zero = opset.constant(0, dtype=t.get_element_type())
+        return opset.select(opset.is_nan(t), zero, t)
+    patched = 0
+    for node in list(model.get_ops()):
+        if node.get_type_name() == "Divide": #and "band_split" in node.get_friendly_name():
+            print("Adding NaN-to-Zero after:", node.get_friendly_name())
+            out = node.output(0)
+
+            # 1) Freeze the current consumer list (BEFORE inserting the new node)
+            original_consumers = list(out.get_target_inputs())
+
+            # 2) Create the nan→zero patch that reads from 'out'
+            fixed = nan_to_zero(out)
+            fixed.set_friendly_name(node.get_friendly_name() + "__nan2zero")
+
+            # 3) Rewire only the ORIGINAL consumers to 'fixed'
+            for inp in original_consumers:
+                # (No need to check; 'fixed' wasn't a consumer yet when we captured the list)
+                inp.replace_source_output(fixed.output(0))
+
+            patched += 1
+
+    print(f"Patched {patched} Divide nodes.")
+
+
 def convert_mdx23c(model, config):
     chunk_size = config.audio.chunk_size
 
@@ -130,7 +159,6 @@ def convert_apollo(model, config):
             openvino.runtime.save_model(ov_model, "apollo_fwd.xml", compress_to_fp16=True)
         print("done converting fwd model.")
 
-
 def convert_mel_band_roformer(model, config):
     print("convert_mel_band_roformer start..")
     chunk_size = config.audio.chunk_size
@@ -177,6 +205,9 @@ def convert_mel_band_roformer(model, config):
         with torch.no_grad():
             torch.onnx.export(fwdmodel, (stft_repr), "fwdmodel.onnx", input_names=["stft_repr"], output_names=["masks"])
             ov_model = convert_model("fwdmodel.onnx")
+            #ov_model = convert_model(fwdmodel, example_input=stft_repr)
+            # We insert some nan-to-zero operations after Divide ops.
+            patch_nan_to_zero(ov_model)
             ov_model.validate_nodes_and_infer_types()
             ov_model.inputs[0].get_tensor().set_names({"stft_repr"})
             ov_model.outputs[0].get_tensor().set_names({"masks"})
