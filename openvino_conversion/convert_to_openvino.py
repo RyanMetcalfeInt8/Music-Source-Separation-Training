@@ -58,7 +58,6 @@ def convert_mdx23c(model, config):
 
         #Converting the 'pre_forward' (stft routine) actually works fine, but C++
         # implementation just used native libtorch instead.
-        '''
         class PreWrapper(nn.Module):
             def __init__(self, model):
                 super().__init__()
@@ -77,9 +76,8 @@ def convert_mdx23c(model, config):
             ov_model.outputs[0].get_tensor().set_names({"x_out"})
             ov_model.reshape(arr.shape)
             ov_model.validate_nodes_and_infer_types()
-            openvino.runtime.save_model(ov_model, "mdx23c_pre.xml", compress_to_fp16=True)
+            openvino.save_model(ov_model, "mdx23c_pre.xml", compress_to_fp16=True)
         print("done converting pre-model...")
-       '''
 
         class FwdWrapper(nn.Module):
             def __init__(self, model):
@@ -98,13 +96,12 @@ def convert_mdx23c(model, config):
             ov_model.outputs[0].get_tensor().set_names({"x_out"})
             ov_model.reshape(pre_fwd_out.shape)
             ov_model.validate_nodes_and_infer_types()
-            openvino.runtime.save_model(ov_model, "mdx23c_fwd.xml", compress_to_fp16=True)
+            openvino.save_model(ov_model, "mdx23c_fwd.xml", compress_to_fp16=True)
         print("done converting fwd model.")
 
         # seems to be some issue in post_forward for conversion.
         # conversion itself seems to work fine, but failures occur during 'reshape', after conversion
         # TODO: Raise this issue to OpenVINO team.
-        '''
         class PostWrapper(nn.Module):
             def __init__(self, model):
                 super().__init__()
@@ -123,9 +120,8 @@ def convert_mdx23c(model, config):
             ov_model.outputs[0].get_tensor().set_names({"x_out"})
             ov_model.reshape(fwd_out.shape)
             ov_model.validate_nodes_and_infer_types()
-            openvino.runtime.save_model(ov_model, "mdx23c_post.xml", compress_to_fp16=True)
+            openvino.save_model(ov_model, "mdx23c_post.xml", compress_to_fp16=True)
         print("done converting post-model...")
-        '''
 
 def convert_apollo(model, config):
     print("convert_apollo start..")

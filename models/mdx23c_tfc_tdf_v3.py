@@ -41,7 +41,9 @@ class STFT:
         x = torch.cat([x, f_pad], -2)
         x = x.reshape([*batch_dims, c // 2, 2, n, t]).reshape([-1, 2, n, t])
         x = x.permute([0, 2, 3, 1])
-        x = x[..., 0] + x[..., 1] * 1.j
+        #x = x[..., 0] + x[..., 1] * 1.j
+        # Convert to complex using view_as_complex, as this resolves some issues during OV conversion.
+        x = torch.view_as_complex(x.contiguous())
         x = torch.istft(x, n_fft=self.n_fft, hop_length=self.hop_length, window=window, center=True)
         x = x.reshape([*batch_dims, 2, -1])
         return x
